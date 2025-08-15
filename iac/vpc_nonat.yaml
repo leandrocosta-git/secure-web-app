@@ -106,9 +106,16 @@ Resources:
           FromPort: 8000
           ToPort: 8000
           CidrIp: !Ref DevIpCidr
+          Description: Allow Flask (8000) from developer IP
         - !If
           - AllowSshFromDevCondition
-          - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref DevIpCidr }
+          - {
+              IpProtocol: tcp,
+              FromPort: 22,
+              ToPort: 22,
+              CidrIp: !Ref DevIpCidr,
+              Description: "Allow SSH from developer IP (optional)"
+            }
           - { Ref: AWS::NoValue }
       SecurityGroupEgress:
         - IpProtocol: -1
