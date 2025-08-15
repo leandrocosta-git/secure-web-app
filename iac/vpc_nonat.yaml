@@ -101,29 +101,41 @@ Resources:
     Properties:
       GroupDescription: App SG
       VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8000
-          ToPort: 8000
-          CidrIp: !Ref DevIpCidr
-          Description: Allow app port 8000 from developer IP
-        - !If
-          - AllowSshFromDevCondition
-          - {
-              IpProtocol: tcp,
-              FromPort: 22,
-              ToPort: 22,
-              CidrIp: !Ref DevIpCidr,
-              Description: "Allow SSH from developer IP"
-            }
-          - { Ref: AWS::NoValue }
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-          Description: Allow all outbound
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-app-sg"
+
+  # Ingress: app port from your DEV /32
+  AppSgIngressApp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSg
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      CidrIp: !Ref DevIpCidr
+      Description: Allow app port 8000 from developer IP
+
+  # (Conditional) Ingress: SSH from your DEV /32
+  AppSgIngressSsh:
+    Condition: AllowSshFromDevCondition
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSg
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref DevIpCidr
+      Description: Allow SSH from developer IP
+
+  # Egress: all outbound
+  AppSgEgressAll:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSg
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+      Description: Allow all outbound
 
 Outputs:
   VpcId:
