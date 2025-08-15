@@ -56,10 +56,12 @@ jobs:
           output_format: sarif
           output_file_path: checkov.sarif
 
-      - name: Upload SARIF to GitHub code scanning
+      - name: Upload SARIF to GitHub code scanning (non-blocking)
+        if: always()                          
+        continue-on-error: true               # DO NOT fail the job if code scanning is disabled
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: checkov.sarif
+          sarif_file: checkov.sarif/results_sarif.sarif
 
   # ---------- IAC scan (fork PRs – no writes/secrets) ----------
   iac-scan-fork:
