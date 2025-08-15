@@ -34,9 +34,10 @@ jobs:
     # Only run with SARIF upload when event is trusted
     if: >
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository)
-    permissions:
+permissions:
       contents: read
       security-events: write   # needed for SARIF upload
       actions: read            # lets upload-sarif resolve run metadata
