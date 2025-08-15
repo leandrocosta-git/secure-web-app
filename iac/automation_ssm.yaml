@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Secure web app – Day 5 automation via SSM (bootstrap app + nginx + logs)"
+Description: "Secure web app – Day 5 automation via SSM (bootstrap app + nginx + logs, KMS-encrypted)"
 
 Parameters:
   ProjectName:
@@ -16,12 +16,44 @@ Parameters:
     Description: S3 bucket with release zips uploaded by CI/CD (read-only for instance role)
 
 Resources:
-  # CloudWatch log group used by nginx & app (encryption optional to keep template simple)
+  LogsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${ProjectName} CloudWatch Logs"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountRootFullAccess
+            Effect: Allow
+            Principal: { AWS: !Sub arn:aws:iam::${AWS::AccountId}:root }
+            Action: "kms:*"
+            Resource: "*"
+          # (Optional but nice): let CloudWatch Logs use the CMK when caller has permissions
+          - Sid: AllowCWLogsUse
+            Effect: Allow
+            Principal: { Service: !Sub logs.${AWS::Region}.amazonaws.com }
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+  LogsKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-cw-logs"
+      TargetKeyId: !Ref LogsKmsKey
+
+  # CloudWatch log group (now with KMS)
   AppLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Ref LogGroupName
       RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Env, Value: dev }
@@ -61,14 +93,12 @@ Resources:
                   python3 -m venv /opt/app/venv
                   /opt/app/venv/bin/pip install --upgrade pip wheel
 
-                  # If a requirements.txt exists (deployed later by CI), install it
                   if [[ -f /opt/app/app/requirements.txt ]]; then
                     /opt/app/venv/bin/pip install -r /opt/app/app/requirements.txt
                   else
                     /opt/app/venv/bin/pip install flask gunicorn
                   fi
 
-                  echo "[*] systemd unit"
                   cat >/etc/systemd/system/app.service <<'UNIT'
                   [Unit]
                   Description=Gunicorn Flask App
@@ -89,7 +119,6 @@ Resources:
                   WantedBy=multi-user.target
                   UNIT
 
-                  echo "[*] Default app files if missing"
                   install -d -m 0755 /opt/app/app
                   install -d -m 0755 /opt/app/log
 
@@ -97,7 +126,6 @@ Resources:
                     cat >/opt/app/app/app.py <<'PY'
                     from flask import Flask, jsonify
                     app = Flask(__name__)
-
                     @app.after_request
                     def secure_headers(resp):
                         resp.headers["X-Frame-Options"] = "DENY"
@@ -105,11 +133,9 @@ Resources:
                         resp.headers["Referrer-Policy"] = "no-referrer"
                         resp.headers["Content-Security-Policy"] = "default-src 'self'"
                         return resp
-
                     @app.get("/health")
                     def health():
                         return "OK", 200
-
                     @app.get("/")
                     def index():
                         return jsonify(message="hello from private ec2"), 200
@@ -121,12 +147,9 @@ Resources:
                   server {
                       listen 80 default_server;
                       server_name _;
-
-                      # Security headers
                       add_header X-Frame-Options "DENY";
                       add_header X-Content-Type-Options "nosniff";
                       add_header Referrer-Policy "no-referrer";
-
                       location / {
                           proxy_pass http://127.0.0.1:${APP_PORT};
                           proxy_set_header Host \$host;
@@ -134,10 +157,7 @@ Resources:
                           proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
                           proxy_set_header X-Forwarded-Proto \$scheme;
                       }
-
-                      location /health {
-                          proxy_pass http://127.0.0.1:${APP_PORT}/health;
-                      }
+                      location /health { proxy_pass http://127.0.0.1:${APP_PORT}/health; }
                   }
                   CONF
                   nginx -t
@@ -152,24 +172,9 @@ Resources:
                       "logs_collected": {
                         "files": {
                           "collect_list": [
-                            {
-                              "file_path": "/var/log/nginx/access.log",
-                              "log_group_name": "${LOG_GROUP}",
-                              "log_stream_name": "{instance_id}/nginx-access",
-                              "timestamp_format": "%d/%b/%Y:%H:%M:%S %z"
-                            },
-                            {
-                              "file_path": "/var/log/nginx/error.log",
-                              "log_group_name": "${LOG_GROUP}",
-                              "log_stream_name": "{instance_id}/nginx-error",
-                              "timestamp_format": "%Y/%m/%d %H:%M:%S"
-                            },
-                            {
-                              "file_path": "/opt/app/log/app-access.log",
-                              "log_group_name": "${LOG_GROUP}",
-                              "log_stream_name": "{instance_id}/app",
-                              "timestamp_format": "%Y-%m-%d %H:%M:%S"
-                            }
+                            { "file_path": "/var/log/nginx/access.log", "log_group_name": "${LOG_GROUP}", "log_stream_name": "{instance_id}/nginx-access" },
+                            { "file_path": "/var/log/nginx/error.log",  "log_group_name": "${LOG_GROUP}", "log_stream_name": "{instance_id}/nginx-error" },
+                            { "file_path": "/opt/app/log/app-access.log","log_group_name": "${LOG_GROUP}", "log_stream_name": "{instance_id}/app" }
                           ]
                         }
                       }
@@ -177,8 +182,7 @@ Resources:
                   }
                   CW
 
-                  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-                    -a stop || true
+                  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop || true
                   /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
                     -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
 
@@ -186,13 +190,10 @@ Resources:
                   systemctl daemon-reload
                   systemctl enable app.service
                   systemctl restart app.service
-
-                # Runtime substitutions
               env:
                 APP_PORT: !Ref AppPort
                 LOG_GROUP: !Ref LogGroupName
 
-  # Association runs once on all instances with Project tag (and on future ones)
   AppBootstrapAssociation:
     Type: AWS::SSM::Association
     Properties:
@@ -201,7 +202,7 @@ Resources:
       Targets:
         - Key: tag:Project
           Values: [ !Ref ProjectName ]
-      ScheduleExpression: "rate(1 day)"     # also re-apply daily to drift-correct
+      ScheduleExpression: "rate(1 day)"
       ComplianceSeverity: MEDIUM
 
 Outputs:
