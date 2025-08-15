@@ -18,8 +18,8 @@ env:
   ARTIFACT_BUCKET: secure-webapp-artifacts-eu-west-1
   APP_DIR: app
   ZIP_NAME: app-${{ github.sha }}.zip
-  VPC_TEMPLATE: iac/vpc_nonat.yaml
-  COMPUTE_TEMPLATE: iac/compute_nonat.yaml
+  VPC_TEMPLATE: iac/vpc.yaml
+  COMPUTE_TEMPLATE: iac/compute.yaml
 
 # prevent overlapping deploys to main
 concurrency:
@@ -124,7 +124,7 @@ jobs:
         run: |
           mkdir -p dist
           # If your requirements.txt lives under app/, this is correct:
-          zip -r "dist/${ZIP_NAME}" "$APP_DIR" app/requirements.txt scripts/ssm_deploy.sh
+          zip -r "dist/${ZIP_NAME}" "$APP_DIR" app/requirements.txt script/ssm_deploy.sh
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -156,7 +156,7 @@ jobs:
               "mkdir -p /opt/app",
               "aws s3 cp s3://${{ env.ARTIFACT_BUCKET }}/releases/${{ env.ZIP_NAME }} /opt/app/app.zip",
               "unzip -o /opt/app/app.zip -d /opt/app",
-              "chmod +x /opt/app/scripts/ssm_deploy.sh",
-              "/opt/app/scripts/ssm_deploy.sh ${{ env.ARTIFACT_BUCKET }} releases/${{ env.ZIP_NAME }}"
+              "chmod +x /opt/app/script/ssm_deploy.sh",
+              "/opt/app/script/ssm_deploy.sh ${{ env.ARTIFACT_BUCKET }} releases/${{ env.ZIP_NAME }}"
             ]' \
             --output text

@@ -964,3 +964,624 @@ aws ec2 create-tags \
   --tags Key=Project,Value=secure-webapp \
   --region eu-west-1 --profile cloudsec-deployer
 ```
+
+granted in ci-cd.yaml the following:
+- minimal global perms
+- full scan + SARIF only if PR is from same repo or push
+- run Checkov (CloudFormation in iac/)
+- and then upload SARIF
+
+```yaml
+name: ci-cd
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+# Minimal global perms
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: eu-west-1
+  ROLE_ARN: arn:aws:iam::017820667577:role/github-actions-deployer
+  ARTIFACT_BUCKET: secure-webapp-artifacts-eu-west-1
+  APP_DIR: app
+  ZIP_NAME: app-${{ github.sha }}.zip
+  VPC_TEMPLATE: iac/vpc_nonat.yaml
+  COMPUTE_TEMPLATE: iac/compute_nonat.yaml
+
+# prevent overlapping deploys to main
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------- IAC scan (trusted pushes and same-repo PRs) ----------
+  iac-scan:
+    name: iac-scan
+    runs-on: ubuntu-latest
+    # Only run with SARIF upload when event is trusted
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+      security-events: write   # needed for SARIF upload
+      actions: read            # lets upload-sarif resolve run metadata
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov (CloudFormation in iac/)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: iac
+          framework: cloudformation
+          # TEMP: skip alternate templates you’re not using today
+          skip_path: iac/vpc.yaml,iac/compute.yaml
+          quiet: true
+          soft_fail: false
+          output_format: sarif
+          output_file_path: checkov.sarif
+
+      - name: Upload SARIF to GitHub code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+
+  # ---------- IAC scan (fork PRs – no writes/secrets) ----------
+  iac-scan-fork:
+    name: iac-scan (fork-safe)
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    permissions:
+      contents: read           # NO security-events write on forks
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov (read-only, no SARIF upload)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: iac
+          framework: cloudformation
+          skip_path: iac/vpc.yaml,iac/compute.yaml
+          quiet: true
+          soft_fail: false     # still fail PR if there are issues
+          output_format: cli
+
+  # ---------- Build, test, and deploy (trusted only) ----------
+  build-test-deploy:
+    name: build-test-deploy
+    runs-on: ubuntu-latest
+    needs: [ iac-scan ]   # don’t proceed unless trusted scan passed
+    # Only deploy on trusted events (push to main or manual dispatch)
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write       # for OIDC → AWS
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install black flake8 pytest
+
+      - name: Lint (flake8)
+        run: flake8 $APP_DIR
+
+      - name: Lint (black)
+        run: black --check $APP_DIR
+
+      - name: Run tests
+        run: pytest -q || (echo "No tests yet."; exit 0)
+
+      - name: Package app
+        run: |
+          mkdir -p dist
+          # If your requirements.txt lives under app/, this is correct:
+          zip -r "dist/${ZIP_NAME}" "$APP_DIR" app/requirements.txt scripts/ssm_deploy.sh
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload artifact to S3
+        run: aws s3 cp "dist/${ZIP_NAME}" "s3://${ARTIFACT_BUCKET}/releases/${ZIP_NAME}"
+
+      - name: Find instance IDs by tag (Project=secure-webapp)
+        id: discover
+        run: |
+          IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=secure-webapp" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text)
+          echo "ids=${IDS}" >> $GITHUB_OUTPUT
+
+      - name: Deploy via SSM
+        if: steps.discover.outputs.ids != ''
+        run: |
+          read -r -a INSTANCES <<< "${{ steps.discover.outputs.ids }}"
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --comment "Secure webapp deploy $GITHUB_SHA" \
+            --instance-ids "${INSTANCES[@]}" \
+            --parameters commands='[
+              "set -euo pipefail",
+              "mkdir -p /opt/app",
+              "aws s3 cp s3://${{ env.ARTIFACT_BUCKET }}/releases/${{ env.ZIP_NAME }} /opt/app/app.zip",
+              "unzip -o /opt/app/app.zip -d /opt/app",
+              "chmod +x /opt/app/scripts/ssm_deploy.sh",
+              "/opt/app/scripts/ssm_deploy.sh ${{ env.ARTIFACT_BUCKET }} releases/${{ env.ZIP_NAME }}"
+            ]' \
+            --output text
+```
+
+Fork-safe split: separate iac-scan (trusted) vs iac-scan-fork (forks). Fork job has no write perms and no SARIF upload → avoids the “Resource not accessible by integration” error and secret exposure.
+
+Deploy only on trusted events: build-test-deploy runs on push/workflow_dispatch (never on PRs).
+
+Job-level permissions: security-events: write only where SARIF is uploaded; OIDC only where AWS is used.
+
+Concurrency: prevents overlapping deploys to main.
+
+Packaging tweak: zips app/requirements.txt (matches your repo layout).
+
+
+#### GHAS problems
+needed to 
+Enable GitHub Code Scanning (Recommended for security visibility)
+
+Go to your repo:
+Settings → Security → Code security and analysis.
+
+Find Code scanning and click Enable.
+
+Keep it in default or choose Advanced setup (since we’re uploading SARIF manually from Checkov).
+
+Push again — the upload-sarif step will now succeed and alerts will show under Security → Code scanning alerts.
+
+made SARIF upload step non-blocking, since GHAS isnt enabled so the SARIF upload step fails and makes the job as failed even with Checkov passing.
+
+Later I can enable GHAS and make the SARIF upload step blocking again.
+
+
+Before deploying the pipeline, ensure the following:
+- S3 bucket exists: aws s3 ls s3://secure-webapp-artifacts-eu-west-1 --profile cloudsec-deployer.
+- OIDC role github-actions-deployer exists and has the secure-webapp-gha-deploy policy attached.
+- At least one EC2 instance running with tag Project=secure-webapp.
+
+```bash
+leandric@Lenovo:~/Documents/Projects/secure-web-app$ # --- Config (edit if needed) ---
+PROFILE=cloudsec-deployer
+REGION=eu-west-1
+BUCKET=secure-webapp-artifacts-eu-west-1
+ROLE_NAME=github-actions-deployer
+REQ_POLICY_NAME=secure-webapp-gha-deploy
+PROJECT_TAG=secure-webapp
+
+echo "== 1) S3 bucket exists & is reachable =="
+aws s3 ls "s3://${BUCKET}" --profile "$PROFILE" && echo "OK: Bucket exists" || echo "MISSING: Create bucket ${BUCKET}"
+
+echo
+echo "== 2) OIDC deploy role exists and has the right policy attached =="
+
+# Show role + trust policy summary
+aws iam get-role --role-name "$ROLE_NAME" --profile "$PROFILE" \
+  --query '{Role:Role.Arn,Trust:Role.AssumeRolePolicyDocument.Statement[0].Condition.StringEquals}' --output json
+
+# Is the local policy attached?
+ATTACHED=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --profile "$PROFILE" \
+  --query "AttachedPolicies[?PolicyName=='${REQ_POLICY_NAME}'].PolicyArn" --output text 2>/dev/null)
+
+if [ -n "$ATTACHED" ]; then
+  echo "OK: Policy ${REQ_POLICY_NAME} is attached -> ${ATTACHED}"
+else
+  echo "MISSING: Attach policy ${REQ_POLICY_NAME} to role ${ROLE_NAME}"
+  echo "If you know the ARN, run:"
+  echo "  aws iam attach-role-policy --role-name ${ROLE_NAME} --policy-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text --profile $PROFILE):policy/${REQ_POLICY_NAME} --profile $PROFILE"
+fidone--output table --region "$REGION" --profile "$PROFILE"rofile.{Arn:Arn,Id:Id}" \ceId,
+== 1) S3 bucket exists & is reachable ==
+OK: Bucket exists
+
+== 2) OIDC deploy role exists and has the right policy attached ==
+{
+    "Role": "arn:aws:iam::017820667577:role/github-actions-deployer",
+    "Trust": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:leandrocosta-git/secure-web-app:ref:refs/heads/main"
+    }
+}
+OK: Policy secure-webapp-gha-deploy is attached -> arn:aws:iam::017820667577:policy/secure-webapp-gha-deploy
+
+== 3) At least one running EC2 instance with tag Project=secure-webapp ==
+------------------------------------------------------------------
+|                        DescribeInstances                       |
++----------------------+------------+----------------------------+
+|          Id          |   Name     |          Subnet            |
++----------------------+------------+----------------------------+
+|  i-032b3f84c375a5329 |  -instance |  subnet-07526fd06f2180be2  |
++----------------------+------------+----------------------------+
+||                              SGs                             ||
+|+--------------------------------------------------------------+|
+||  sg-0b753284caef5cc18                                        ||
+|+--------------------------------------------------------------+|
+OK: Found instance(s): i-032b3f84c375a5329
+
+== 3a) Confirm SSM is online for those instance(s) (so Deploy step can work) ==
+----------------------------------------------------------
+|               DescribeInstanceInformation              |
++----------+---------------------------------------------+
+|  Id      |  i-032b3f84c375a5329                        |
+|  Name    |  ip-10-0-1-242.eu-west-1.compute.internal   |
+|  Ping    |  Online                                     |
+|  Platform|  Linux                                      |
++----------+---------------------------------------------+
+
+== 3b) (Optional) Show IAM instance profile attached to each instance ==
+-- i-032b3f84c375a5329
+-------------------------------------------------------------------------------------------------------
+|                               DescribeIamInstanceProfileAssociations                                |
++-----+-----------------------------------------------------------------------------------------------+
+|  Arn|  arn:aws:iam::017820667577:instance-profile/secure-compute-dev-InstanceProfile-jauQhHrtUYKI   |
+|  Id |  AIPAQIJRRZ24TX3L3YIOF                                                                        |
++-----+-----------------------------------------------------------------------------------------------+
+```
+
+S3 bucket exists → pipeline can upload artifacts.
+
+OIDC role + correct policy attached → GitHub Actions can assume role securely.
+
+EC2 instance found & SSM online → Deploy step will be able to run commands.
+
+Tested before merging
+```bash
+gh workflow run ci-cd.yml -f ref=ci/setup-ci
+gh run watch
+```
+
+### Day 7
+
+I had to finish the following from previous days:
+- Move EC2 to private subnet with NAT Gateway
+- Enable AWS WAF on ALB with OWASP Top 10
+
+ok- Python Automation (manual → automated)
+ok- Enable CloudWatch Logs for Flask + Nginx:
+
+
+- Create SNS topic for alerts:
+
+
+created an automation_ssm document to automate the deployment process.
+
+updated compute_nonat to add instance role needs S3 read
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure Web App - Compute (Dev Mode - Public Subnet)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: secure-webapp
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    # Amazon Linux 2 (eu-west-1) – update if needed
+    Default: ami-0c1bc246476a5572b
+  ArtifactBucket:
+    Type: String
+    Default: ""
+    Description: "(Optional) S3 bucket where CI/CD uploads app zips (grants s3:GetObject to /releases/* if set)"
+
+Conditions:
+  HasArtifactBucket: !Not [ !Equals [ !Ref ArtifactBucket, "" ] ]
+
+Resources:
+  # --- KMS key for log encryption ---
+  LogKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${ProjectName} CloudWatch Logs"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
+
+  LogKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-logs"
+      TargetKeyId: !Ref LogKmsKey
+
+  # --- Log group (KMS encrypted) ---
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/app"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogKmsKey.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
+
+  # --- Instance role & profile ---
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      Tags:
+        - Key: Name
+          Value: secure-webapp-instance-role
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - !If
+          - HasArtifactBucket
+          - PolicyName: ReadArtifactsFromS3
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: ReadArtifacts
+                  Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                  Resource:
+                    - !Sub "arn:aws:s3:::${ArtifactBucket}/releases/*"
+          - !Ref "AWS::NoValue"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref InstanceRole ]
+
+  # --- EC2 instance ---
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref AppSecurityGroupId ]
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref AmiId
+      Tags:
+        - { Key: Name,    Value: !Sub "${ProjectName}-instance" }
+        - { Key: Project, Value: !Ref ProjectName }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "[*] Base updates & tools"
+          yum update -y
+          yum install -y python3 python3-pip nginx unzip amazon-cloudwatch-agent
+
+          echo "[*] Enable + start SSM agent"
+          systemctl enable amazon-ssm-agent || true
+          systemctl start amazon-ssm-agent || true
+
+          echo "[*] Python deps"
+          python3 -m pip install --upgrade pip wheel
+          python3 -m pip install flask gunicorn
+
+          echo "[*] App layout"
+          install -d -m 0755 /opt/app
+          cat >/opt/app/app.py <<'PY'
+          from flask import Flask, jsonify
+          app = Flask(__name__)
+
+          @app.after_request
+          def secure_headers(resp):
+              resp.headers["X-Frame-Options"] = "DENY"
+              resp.headers["X-Content-Type-Options"] = "nosniff"
+              resp.headers["Referrer-Policy"] = "no-referrer"
+              resp.headers["Content-Security-Policy"] = "default-src 'self'"
+              return resp
+
+          @app.get("/health")
+          def health():
+              return "OK", 200
+
+          @app.get("/")
+          def index():
+              return jsonify(message="hello from private ec2"), 200
+          PY
+
+          echo "[*] systemd unit (Gunicorn on 0.0.0.0:8000)"
+          cat >/etc/systemd/system/app.service <<'UNIT'
+          [Unit]
+          Description=Gunicorn Flask App
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/app
+          ExecStart=/usr/local/bin/gunicorn -b 0.0.0.0:8000 app:app --access-logfile /var/log/gunicorn/app.log
+          Restart=always
+          RestartSec=2s
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          install -d -m 0755 /var/log/gunicorn
+
+          echo "[*] Nginx reverse proxy (optional; comment out if you prefer direct :8000)"
+          cat >/etc/nginx/conf.d/app.conf <<'CONF'
+          server {
+              listen 80 default_server;
+              server_name _;
+
+              # Security headers
+              add_header X-Frame-Options "DENY";
+              add_header X-Content-Type-Options "nosniff";
+              add_header Referrer-Policy "no-referrer";
+
+              location / {
+                  proxy_pass http://127.0.0.1:8000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location /health {
+                  proxy_pass http://127.0.0.1:8000/health;
+              }
+          }
+          CONF
+
+          nginx -t && systemctl enable nginx && systemctl restart nginx
+
+          echo "[*] CloudWatch agent config (logs -> /${ProjectName}/app)"
+          cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CW
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/nginx/access.log",
+                      "log_group_name": "/${ProjectName}/app",
+                      "log_stream_name": "{instance_id}/nginx-access",
+                      "timestamp_format": "%d/%b/%Y:%H:%M:%S %z"
+                    },
+                    {
+                      "file_path": "/var/log/nginx/error.log",
+                      "log_group_name": "/${ProjectName}/app",
+                      "log_stream_name": "{instance_id}/nginx-error",
+                      "timestamp_format": "%Y/%m/%d %H:%M:%S"
+                    },
+                    {
+                      "file_path": "/var/log/gunicorn/app.log",
+                      "log_group_name": "/${ProjectName}/app",
+                      "log_stream_name": "{instance_id}/app",
+                      "timestamp_format": "%Y-%m-%d %H:%M:%S"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          CW
+
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop || true
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+          echo "[*] Enable & start app"
+          systemctl daemon-reload
+          systemctl enable app.service
+          systemctl restart app.service
+
+Outputs:
+  InstanceId:
+    Value: !Ref EC2Instance
+  PublicIp:
+    Value: !GetAtt EC2Instance.PublicIp
+  PublicDns:
+    Value: !GetAtt EC2Instance.PublicDnsName
+  InstanceProfileArn:
+    Value: !GetAtt InstanceProfile.Arn
+  LogGroupName:
+    Value: !Ref LogGroup
+```
+
+added waf and monitoring.yamls
+
+
+
+
+
+checked
+```bash
+PROFILE=cloudsec-deployer
+REGION=eu-west-1
+BUCKET=secure-webapp-artifacts-eu-west-1
+
+# S3 bucket exists
+aws s3 ls s3://$BUCKET --profile $PROFILE >/dev/null && echo "S3 OK"
+
+# OIDC deploy role & policy
+aws iam get-role --role-name github-actions-deployer --profile $PROFILE --query Role.Arn
+aws iam list-attached-role-policies --role-name github-actions-deployer --profile $PROFILE \
+  --query "AttachedPolicies[].PolicyName" | grep -q secure-webapp-gha-deploy && echo "Role+Policy OK"
+
+# Instance online & tagged (needed by deploy job)
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=secure-webapp" "Name=instance-state-name,Values=running" \
+  --query "Reservations[].Instances[].InstanceId" --profile $PROFILE --region $REGION
+
+# SSM reachable (deploy uses AWS-RunShellScript)
+aws ssm describe-instance-information --profile $PROFILE --region $REGION \
+  --query "InstanceInformationList[].{Id:InstanceId,Ping:PingStatus}"
+S3 OK
+"arn:aws:iam::017820667577:role/github-actions-deployer"
+Role+Policy OK
+[
+    "i-032b3f84c375a5329"
+]
+[
+    {
+        "Id": "i-032b3f84c375a5329",
+        "Ping": "Online"
+    }
+]
+```
+
+## Deploy Template
+
+When deploying:
+You might change the following variables:
+```bash
+PROFILE=cloudsec-deployer
+REGION=eu-west-1
+STACK_VPC=secure-vpc-dev
+PROJECT=secure-webapp
+DEV_CIDR=YOUR.PUBLIC.IP.ADDR/32      # <- update this!
+AZA=eu-west-1a
+AZB=eu-west-1b
+```

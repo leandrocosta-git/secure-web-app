@@ -1,22 +1,60 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: EC2 (private) with SSM + CloudWatch in secure-webapp VPC
+Description: Secure Web App - Private EC2 with SSM + Flask + CW Agent (+ optional TG attachment)
 
 Parameters:
-  ProjectName: { Type: String }
-  SubnetId:    { Type: AWS::EC2::Subnet::Id, Description: "Private subnet ID (e.g., PrivateSubnetAId)" }
-  AppSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
-  InstanceType: { Type: String, Default: t3.micro }
-  # Use latest Amazon Linux 2 via SSM Parameter (x86_64). You can swap to AL2023 if you prefer.
+  ProjectName:
+    Type: String
+  PrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  AlbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  InstanceType:
+    Type: String
+    Default: t3.micro
   AmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Type: AWS::EC2::Image::Id
+    # Amazon Linux 2 in eu-west-1 (update if you change region)
+    Default: ami-0c1bc246476a5572b
+  # NEW: pass the ALB Target Group to auto-register the instance
+  TargetGroupArn:
+    Type: String
+    Default: ""         # leave blank to skip attachment
+    Description: Optional ALB Target Group ARN to attach this instance on port 8000
+
+Conditions:
+  HasTargetGroupArn: !Not [ !Equals [ !Ref TargetGroupArn, "" ] ]
 
 Resources:
-  LogGroup:
+  # KMS for app log group (Checkov: encrypt log groups)
+  LogKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${ProjectName} application logs"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+
+  LogKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-logs"
+      TargetKeyId: !Ref LogKmsKey
+
+  AppLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/${ProjectName}/app"
       RetentionInDays: 30
+      KmsKeyId: !GetAtt LogKmsKey.Arn
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Env, Value: dev }
@@ -24,123 +62,151 @@ Resources:
   InstanceRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ProjectName}-AppInstanceRole"
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: [ ec2.amazonaws.com ] }
+            Principal: { Service: ec2.amazonaws.com }
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-      Policies:
-        - PolicyName: AppLogsMinimal
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "${LogGroup.Arn}:*"
       Tags:
-        - { Key: Project, Value: !Ref ProjectName }
-        - { Key: Env, Value: dev }
+        - { Key: Name, Value: secure-webapp-instance-role }
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
+      Path: /
       Roles: [ !Ref InstanceRole ]
 
-  EC2:
+  # Keep SGs decoupled across stacks; allow ALB -> app:8000 here
+  AppIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !Ref AlbSecurityGroupId
+      Description: Allow HTTP from ALB on 8000
+
+  EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
-      ImageId: !Ref AmiId
       InstanceType: !Ref InstanceType
-      IamInstanceProfile: !Ref InstanceProfile
-      SubnetId: !Ref SubnetId
+      SubnetId: !Ref PrivateSubnetId
       SecurityGroupIds: [ !Ref AppSecurityGroupId ]
-      # No public IP in private subnet
-      SourceDestCheck: true
-      MetadataOptions:   # Enforce IMDSv2
-        HttpTokens: required
-        HttpEndpoint: enabled
-        HttpPutResponseHopLimit: 2
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref AmiId
       Tags:
         - { Key: Name, Value: !Sub "${ProjectName}-app-ec2" }
         - { Key: Project, Value: !Ref ProjectName }
-        - { Key: Env, Value: dev }
       UserData:
         Fn::Base64: !Sub |
-          #!/bin/bash -xe
-          # Update base OS and install deps
+          #!/bin/bash
+          set -euxo pipefail
+
+          # Base
           yum update -y
+          yum install -y python3 python3-pip nginx unzip
 
-          systemctl enable amazon-ssm-agent
-          systemctl start amazon-ssm-agent
-
-          yum install -y python3 pip jq
-          # Install CloudWatch Agent
-          yum install -y amazon-cloudwatch-agent
-
-          # Prepare directories
+          # App dirs
           mkdir -p /opt/app /var/log/gunicorn
+          chown -R root:root /opt/app /var/log/gunicorn
 
-          # Minimal placeholder app (we'll replace on Day 3)
-          cat >/opt/app/app.py <<'PY'
-          from flask import Flask, jsonify, Response
+          # Minimal Flask app
+          cat <<'PY' > /opt/app/app.py
+          from flask import Flask, jsonify
           app = Flask(__name__)
+
           @app.after_request
-          def set_headers(resp: Response):
-              resp.headers["X-Frame-Options"]="DENY"
-              resp.headers["X-Content-Type-Options"]="nosniff"
-              resp.headers["Referrer-Policy"]="no-referrer"
-              resp.headers["Strict-Transport-Security"]="max-age=31536000; includeSubDomains; preload"
-              resp.headers["Content-Security-Policy"]="default-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
-              resp.headers["X-XSS-Protection"]="0"
+          def set_headers(resp):
+              resp.headers["X-Frame-Options"] = "DENY"
+              resp.headers["X-Content-Type-Options"] = "nosniff"
+              resp.headers["Referrer-Policy"] = "no-referrer"
               return resp
+
           @app.get("/health")
-          def health(): return jsonify(status="ok"), 200
+          def health():
+              return "OK", 200
+
           @app.get("/")
-          def index(): return jsonify(message="hello from private ec2"), 200
+          def index():
+              return jsonify(message="hello from private ec2"), 200
           PY
 
           # Python deps
-          pip3 install --no-cache-dir flask gunicorn
+          pip3 install --upgrade pip
+          pip3 install flask gunicorn
 
-          # Systemd service for gunicorn (will start on Day 3 after ALB is in place or for local curl)
-          cat >/etc/systemd/system/app.service <<'SVC'
+          # Gunicorn systemd
+          cat <<'UNIT' > /etc/systemd/system/app.service
           [Unit]
           Description=Gunicorn Flask App
           After=network.target
+
           [Service]
-          Type=simple
+          User=root
           WorkingDirectory=/opt/app
-          ExecStart=/usr/local/bin/gunicorn -b 0.0.0.0:8000 app:app --access-logfile /var/log/gunicorn/app.log
+          ExecStart=/usr/bin/python3 /usr/local/bin/gunicorn -b 0.0.0.0:8000 app:app --access-logfile /var/log/gunicorn/app.log
           Restart=always
+
           [Install]
           WantedBy=multi-user.target
-          SVC
+          UNIT
 
           systemctl daemon-reload
-          systemctl enable app.service
-          systemctl start app.service
+          systemctl enable app
+          systemctl start app
 
-          # CloudWatch Agent config for basic logs
-          cat >/opt/cwagent.json <<CW
+          # Nginx reverse proxy (local)
+          cat >/etc/nginx/conf.d/app.conf <<'NGINX'
+          server {
+            listen 80;
+            location / {
+              proxy_pass http://127.0.0.1:8000;
+              proxy_set_header Host $host;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+            location /health { proxy_pass http://127.0.0.1:8000/health; }
+          }
+          NGINX
+          systemctl enable nginx
+          systemctl restart nginx
+
+          # CloudWatch Agent for logs
+          yum install -y amazon-cloudwatch-agent
+          cat <<'CWA' > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
           {
             "logs": {
               "logs_collected": {
-                "files": { "collect_list": [
-                  { "file_path": "/var/log/messages", "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/messages" },
-                  { "file_path": "/var/log/cloud-init.log", "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/cloud-init" },
-                  { "file_path": "/var/log/gunicorn/app.log", "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/gunicorn" }
-                ]}
+                "files": {
+                  "collect_list": [
+                    { "file_path": "/var/log/gunicorn/app.log", "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/gunicorn" },
+                    { "file_path": "/var/log/nginx/access.log", "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/nginx-access" },
+                    { "file_path": "/var/log/nginx/error.log",  "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/nginx-error" }
+                  ]
+                }
               }
             }
           }
-          CW
-          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/cwagent.json -s
+          CWA
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+  # NEW: register instance into the ALB Target Group on port 8000
+  AppTargetGroupAttachment:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroupAttachment
+    Condition: HasTargetGroupArn
+    Properties:
+      TargetGroupArn: !Ref TargetGroupArn
+      TargetId: !Ref EC2Instance
+      Port: 8000
 
 Outputs:
-  InstanceId: { Value: !Ref EC2 }
+  InstanceId:
+    Value: !Ref EC2Instance
+  InstanceProfileArn:
+    Value: !GetAtt InstanceProfile.Arn
