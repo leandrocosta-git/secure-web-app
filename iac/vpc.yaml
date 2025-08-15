@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: VPC with 2AZ public (ALB) + private (App) subnets and security groups
+Parameters:
+  ProjectName:
+    Type: String
+  CidrBlock:
+    Type: String
+    Default: 10.0.0.0/16
+  AzA:
+    Type: AWS::EC2::AvailabilityZone::Name
+  AzB:
+    Type: AWS::EC2::AvailabilityZone::Name
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref CidrBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-vpc' }]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref IGW }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzA
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-a' }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzB
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-b' }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzA
+      CidrBlock: 10.0.10.0/24
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-private-a' }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AzB
+      CidrBlock: 10.0.11.0/24
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-private-b' }]
+
+  NatEIPA:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  NatEIPB:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  NatGwA:
+    Type: AWS::EC2::NatGateway
+    Properties: { SubnetId: !Ref PublicSubnetA, AllocationId: !GetAtt NatEIPA.AllocationId }
+  NatGwB:
+    Type: AWS::EC2::NatGateway
+    Properties: { SubnetId: !Ref PublicSubnetB, AllocationId: !GetAtt NatEIPB.AllocationId }
+
+  RtPublic:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  RtPublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref RtPublic, SubnetId: !Ref PublicSubnetA }
+  RtPublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref RtPublic, SubnetId: !Ref PublicSubnetB }
+  RtPublicDefault:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref RtPublic, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW }
+
+  RtPrivateA:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  RtPrivateB:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  RtPrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref RtPrivateA, SubnetId: !Ref PrivateSubnetA }
+  RtPrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref RtPrivateB, SubnetId: !Ref PrivateSubnetB }
+  RtPrivateDefaultA:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref RtPrivateA, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGwA }
+  RtPrivateDefaultB:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref RtPrivateB, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGwB }
+
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSg
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  VpcId: { Value: !Ref VPC }
+  PublicSubnetAId: { Value: !Ref PublicSubnetA }
+  PublicSubnetBId: { Value: !Ref PublicSubnetB }
+  PrivateSubnetAId: { Value: !Ref PrivateSubnetA }
+  PrivateSubnetBId: { Value: !Ref PrivateSubnetB }
+  AlbSgId: { Value: !Ref AlbSg }
+  AppSgId: { Value: !Ref AppSg }

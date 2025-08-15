@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EC2 (private) with SSM + CloudWatch in secure-webapp VPC
+
+Parameters:
+  ProjectName: { Type: String }
+  SubnetId:    { Type: AWS::EC2::Subnet::Id, Description: "Private subnet ID (e.g., PrivateSubnetAId)" }
+  AppSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
+  InstanceType: { Type: String, Default: t3.micro }
+  # Use latest Amazon Linux 2 via SSM Parameter (x86_64). You can swap to AL2023 if you prefer.
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/app"
+      RetentionInDays: 30
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-AppInstanceRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [ ec2.amazonaws.com ] }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AppLogsMinimal
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${LogGroup.Arn}:*"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref InstanceRole ]
+
+  EC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref AppSecurityGroupId ]
+      # No public IP in private subnet
+      SourceDestCheck: true
+      MetadataOptions:   # Enforce IMDSv2
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-app-ec2" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update base OS and install deps
+          yum update -y
+
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+
+          yum install -y python3 pip jq
+          # Install CloudWatch Agent
+          yum install -y amazon-cloudwatch-agent
+
+          # Prepare directories
+          mkdir -p /opt/app /var/log/gunicorn
+
+          # Minimal placeholder app (we'll replace on Day 3)
+          cat >/opt/app/app.py <<'PY'
+          from flask import Flask, jsonify, Response
+          app = Flask(__name__)
+          @app.after_request
+          def set_headers(resp: Response):
+              resp.headers["X-Frame-Options"]="DENY"
+              resp.headers["X-Content-Type-Options"]="nosniff"
+              resp.headers["Referrer-Policy"]="no-referrer"
+              resp.headers["Strict-Transport-Security"]="max-age=31536000; includeSubDomains; preload"
+              resp.headers["Content-Security-Policy"]="default-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+              resp.headers["X-XSS-Protection"]="0"
+              return resp
+          @app.get("/health")
+          def health(): return jsonify(status="ok"), 200
+          @app.get("/")
+          def index(): return jsonify(message="hello from private ec2"), 200
+          PY
+
+          # Python deps
+          pip3 install --no-cache-dir flask gunicorn
+
+          # Systemd service for gunicorn (will start on Day 3 after ALB is in place or for local curl)
+          cat >/etc/systemd/system/app.service <<'SVC'
+          [Unit]
+          Description=Gunicorn Flask App
+          After=network.target
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/app
+          ExecStart=/usr/local/bin/gunicorn -b 0.0.0.0:8000 app:app --access-logfile /var/log/gunicorn/app.log
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+
+          systemctl daemon-reload
+          systemctl enable app.service
+          systemctl start app.service
+
+          # CloudWatch Agent config for basic logs
+          cat >/opt/cwagent.json <<CW
+          {
+            "logs": {
+              "logs_collected": {
+                "files": { "collect_list": [
+                  { "file_path": "/var/log/messages", "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/messages" },
+                  { "file_path": "/var/log/cloud-init.log", "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/cloud-init" },
+                  { "file_path": "/var/log/gunicorn/app.log", "log_group_name": "/${ProjectName}/app", "log_stream_name": "{instance_id}/gunicorn" }
+                ]}
+              }
+            }
+          }
+          CW
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/cwagent.json -s
+
+Outputs:
+  InstanceId: { Value: !Ref EC2 }
