@@ -37,7 +37,8 @@ jobs:
         with:
           directory: iac
           framework: cloudformation
-          skip_path: | #change this after
+          #change this after
+          skip_path: | 
             iac/vpc.yaml
             iac/compute.yaml   
           quiet: true 
