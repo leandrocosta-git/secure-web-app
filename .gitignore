@@ -3,4 +3,6 @@ __pycache__/
 README.md
 
 /iam
-/script
+/scriptsession-manager-plugin.deb
+tmp/
+
