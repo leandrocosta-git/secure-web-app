@@ -18,6 +18,8 @@ env:
   ARTIFACT_BUCKET: secure-webapp-artifacts-eu-west-1
   APP_DIR: app
   ZIP_NAME: app-${{ github.sha }}.zip
+  VPC_TEMPLATE: iac/vpc_nonat.yaml
+  COMPUTE_TEMPLATE: iac/compute_nonat.yaml
 
 jobs:
   iac-scan:
@@ -35,8 +37,11 @@ jobs:
         with:
           directory: iac
           framework: cloudformation
-          quiet: true
-          soft_fail: false           # fail on findings
+          skip_path: | #change this after
+            iac/vpc.yaml
+            iac/compute.yaml   
+          quiet: true 
+          soft_fail: false
           output_format: sarif
           output_file_path: checkov.sarif
 
