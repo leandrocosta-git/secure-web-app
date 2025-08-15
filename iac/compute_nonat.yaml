@@ -16,23 +16,40 @@ Parameters:
     Default: ami-0c1bc246476a5572b  # Amazon Linux 2 (eu-west-1) – update as needed
 
 Resources:
-  InstanceRole:
-    Type: AWS::IAM::Role
+  # NEW: KMS key for log encryption
+  LogKmsKey:
+    Type: AWS::KMS::Key
     Properties:
-      AssumeRolePolicyDocument:
+      Description: !Sub "KMS key for ${ProjectName} CloudWatch Logs"
+      EnableKeyRotation: true
+      KeyPolicy:
         Version: "2012-10-17"
         Statement:
-          - Effect: Allow
+          - Sid: AllowRoot
+            Effect: Allow
             Principal:
-              Service: ec2.amazonaws.com
-            Action: sts:AssumeRole
-      Path: /
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
       Tags:
-        - Key: Name
-          Value: !Sub "${ProjectName}-instance-role"
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
+
+  LogKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-logs"
+      TargetKeyId: !Ref LogKmsKey
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/app"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogKmsKey.Arn   # <-- add this
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
