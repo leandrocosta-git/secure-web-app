@@ -1,212 +1,100 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Secure web app – Day 5 automation via SSM (bootstrap app + nginx + logs, KMS-encrypted)"
+Description: "Monitoring – SNS (KMS) + basic CW alarms (CPU, 5xx via ALB metric)"
 
 Parameters:
   ProjectName:
     Type: String
     Default: secure-webapp
-  AppPort:
-    Type: Number
-    Default: 8000
-  LogGroupName:
+  AlertEmail:
     Type: String
-    Default: /secure-webapp/app
-  ArtifactBucket:
+    Description: "Email to subscribe to SNS topic (confirm in inbox)"
+  AlbFullName:
     Type: String
-    Description: S3 bucket with release zips uploaded by CI/CD (read-only for instance role)
+    Description: "ALB full name (for metrics), e.g. app/secure-webapp-alb/abcdef1234567890"
+  AlbTargetGroupFullName:
+    Type: String
+    Description: "Target Group full name for metrics, e.g. targetgroup/secure-webapp-tg/abcdef1234567890"
 
 Resources:
-  LogsKmsKey:
+  SnsKmsKey:
     Type: AWS::KMS::Key
     Properties:
-      Description: !Sub "KMS key for ${ProjectName} CloudWatch Logs"
+      Description: !Sub "KMS for ${ProjectName} alerts (SNS)"
       EnableKeyRotation: true
       KeyPolicy:
         Version: "2012-10-17"
         Statement:
-          - Sid: AllowAccountRootFullAccess
+          - Sid: AllowRoot
             Effect: Allow
-            Principal: { AWS: !Sub arn:aws:iam::${AWS::AccountId}:root }
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
             Action: "kms:*"
             Resource: "*"
-          # (Optional but nice): let CloudWatch Logs use the CMK when caller has permissions
-          - Sid: AllowCWLogsUse
-            Effect: Allow
-            Principal: { Service: !Sub logs.${AWS::Region}.amazonaws.com }
-            Action:
-              - kms:Encrypt
-              - kms:Decrypt
-              - kms:ReEncrypt*
-              - kms:GenerateDataKey*
-              - kms:DescribeKey
-            Resource: "*"
 
-  LogsKmsAlias:
+  SnsKmsAlias:
     Type: AWS::KMS::Alias
     Properties:
-      AliasName: !Sub "alias/${ProjectName}-cw-logs"
-      TargetKeyId: !Ref LogsKmsKey
+      AliasName: !Sub "alias/${ProjectName}-sns"
+      TargetKeyId: !Ref SnsKmsKey
 
-  # CloudWatch log group (now with KMS)
-  AppLogGroup:
-    Type: AWS::Logs::LogGroup
+  AlertsTopic:
+    Type: AWS::SNS::Topic
     Properties:
-      LogGroupName: !Ref LogGroupName
-      RetentionInDays: 30
-      KmsKeyId: !GetAtt LogsKmsKey.Arn
-      Tags:
-        - { Key: Project, Value: !Ref ProjectName }
-        - { Key: Env, Value: dev }
-
-  # SSM Document that bootstraps the instance
-  AppBootstrapDocument:
-    Type: AWS::SSM::Document
-    Properties:
-      DocumentType: Command
-      Name: !Sub "${ProjectName}-bootstrap"
-      TargetType: /AWS::EC2::Instance
+      TopicName: !Sub "${ProjectName}-alerts"
+      KmsMasterKeyId: !GetAtt SnsKmsKey.Arn
       Tags:
         - Key: Project
           Value: !Ref ProjectName
-      Content:
-        schemaVersion: "2.2"
-        description: "Install Python/Gunicorn, configure systemd app, Nginx reverse proxy, CloudWatch agent"
-        mainSteps:
-          - name: Bootstrap
-            action: aws:runShellScript
-            inputs:
-              timeoutSeconds: 3600
-              runCommand:
-                - |
-                  #!/bin/bash
-                  set -euo pipefail
-                  echo "[*] Updating base system & installing packages"
-                  yum update -y
-                  yum install -y python3 python3-pip nginx unzip
+        - Key: Env
+          Value: dev
 
-                  echo "[*] Ensure SSM agent enabled"
-                  systemctl enable amazon-ssm-agent || true
-                  systemctl start amazon-ssm-agent || true
-
-                  echo "[*] App dir & venv"
-                  install -d -m 0755 /opt/app
-                  python3 -m venv /opt/app/venv
-                  /opt/app/venv/bin/pip install --upgrade pip wheel
-
-                  if [[ -f /opt/app/app/requirements.txt ]]; then
-                    /opt/app/venv/bin/pip install -r /opt/app/app/requirements.txt
-                  else
-                    /opt/app/venv/bin/pip install flask gunicorn
-                  fi
-
-                  cat >/etc/systemd/system/app.service <<'UNIT'
-                  [Unit]
-                  Description=Gunicorn Flask App
-                  After=network-online.target
-                  Wants=network-online.target
-
-                  [Service]
-                  Type=simple
-                  User=root
-                  WorkingDirectory=/opt/app/app
-                  Environment="PATH=/opt/app/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
-                  ExecStart=/opt/app/venv/bin/gunicorn -b 127.0.0.1:${APP_PORT} app:app --access-logfile /opt/app/log/app-access.log
-                  Restart=always
-                  RestartSec=2s
-                  LimitNOFILE=65536
-
-                  [Install]
-                  WantedBy=multi-user.target
-                  UNIT
-
-                  install -d -m 0755 /opt/app/app
-                  install -d -m 0755 /opt/app/log
-
-                  if [[ ! -f /opt/app/app/app.py ]]; then
-                    cat >/opt/app/app/app.py <<'PY'
-                    from flask import Flask, jsonify
-                    app = Flask(__name__)
-                    @app.after_request
-                    def secure_headers(resp):
-                        resp.headers["X-Frame-Options"] = "DENY"
-                        resp.headers["X-Content-Type-Options"] = "nosniff"
-                        resp.headers["Referrer-Policy"] = "no-referrer"
-                        resp.headers["Content-Security-Policy"] = "default-src 'self'"
-                        return resp
-                    @app.get("/health")
-                    def health():
-                        return "OK", 200
-                    @app.get("/")
-                    def index():
-                        return jsonify(message="hello from private ec2"), 200
-                    PY
-                  fi
-
-                  echo "[*] Nginx reverse proxy"
-                  cat >/etc/nginx/conf.d/app.conf <<CONF
-                  server {
-                      listen 80 default_server;
-                      server_name _;
-                      add_header X-Frame-Options "DENY";
-                      add_header X-Content-Type-Options "nosniff";
-                      add_header Referrer-Policy "no-referrer";
-                      location / {
-                          proxy_pass http://127.0.0.1:${APP_PORT};
-                          proxy_set_header Host \$host;
-                          proxy_set_header X-Real-IP \$remote_addr;
-                          proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                          proxy_set_header X-Forwarded-Proto \$scheme;
-                      }
-                      location /health { proxy_pass http://127.0.0.1:${APP_PORT}/health; }
-                  }
-                  CONF
-                  nginx -t
-                  systemctl enable nginx
-                  systemctl restart nginx
-
-                  echo "[*] CloudWatch agent (logs)"
-                  yum install -y amazon-cloudwatch-agent
-                  cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CW'
-                  {
-                    "logs": {
-                      "logs_collected": {
-                        "files": {
-                          "collect_list": [
-                            { "file_path": "/var/log/nginx/access.log", "log_group_name": "${LOG_GROUP}", "log_stream_name": "{instance_id}/nginx-access" },
-                            { "file_path": "/var/log/nginx/error.log",  "log_group_name": "${LOG_GROUP}", "log_stream_name": "{instance_id}/nginx-error" },
-                            { "file_path": "/opt/app/log/app-access.log","log_group_name": "${LOG_GROUP}", "log_stream_name": "{instance_id}/app" }
-                          ]
-                        }
-                      }
-                    }
-                  }
-                  CW
-
-                  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop || true
-                  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-                    -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
-
-                  echo "[*] Enable & start app"
-                  systemctl daemon-reload
-                  systemctl enable app.service
-                  systemctl restart app.service
-              env:
-                APP_PORT: !Ref AppPort
-                LOG_GROUP: !Ref LogGroupName
-
-  AppBootstrapAssociation:
-    Type: AWS::SSM::Association
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
     Properties:
-      Name: !Ref AppBootstrapDocument
-      AssociationName: !Sub "${ProjectName}-bootstrap-assoc"
-      Targets:
-        - Key: tag:Project
-          Values: [ !Ref ProjectName ]
-      ScheduleExpression: "rate(1 day)"
-      ComplianceSeverity: MEDIUM
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref AlertsTopic
 
-Outputs:
-  SsmDocumentName:
-    Value: !Ref AppBootstrapDocument
-  LogGroup:
-    Value: !Ref AppLogGroup
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-cpu-high"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      Threshold: 80
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: CPUUtilization
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: dummy # replace if you use ASG; or use InstanceId dimension per-instance
+            Period: 60
+            Stat: Average
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alb-5xx"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_ELB_5XX_Count
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !Ref AlbFullName
+            Period: 60
+            Stat: Sum
+      AlarmActions:
+        - !Ref AlertsTopic
