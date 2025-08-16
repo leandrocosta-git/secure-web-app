@@ -82,6 +82,23 @@ echo "APP_SG=$APP_SG ALB_SG=$ALB_SG"
 ### --------------------------
 ### 2) ALB + WAF (OWASP managed rules)
 ### --------------------------
+
+ALB_PARAMS=(
+  ProjectName="$PROJECT"
+  VpcId="$VPC_ID"
+  PublicSubnetAId="$PUBA"
+  PublicSubnetBId="$PUBB"
+  AppTargetPort=8000
+)
+
+# Only pass AcmCertArn if you set it
+if [[ -n "${ACM_ARN:-}" ]]; then
+  ALB_PARAMS+=(AcmCertArn="$ACM_ARN")
+else
+  ALB_PARAMS+=(AcmCertArn="")  # safe default
+fi
+
+
 echo "== deploy: ALB + WAF =="
 aws cloudformation deploy \
   --template-file "$ALB_TEMPLATE" \
@@ -117,8 +134,9 @@ aws cloudformation deploy \
   --stack-name "$STACK_EC2" \
   --parameter-overrides \
     ProjectName="$PROJECT" \
-    SubnetId="$PRIVA" \
+    PrivateSubnetId="$PRIVA" \
     AppSecurityGroupId="$APP_SG" \
+    AlbSecurityGroupId="$ALB_SG" \
     InstanceType="$INSTANCE_TYPE" \
     AmiId="$AMI_ID" \
     TargetGroupArn="$TG_ARN" \

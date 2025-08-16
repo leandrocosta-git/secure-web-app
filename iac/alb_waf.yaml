@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure Web App - ALB + WAF (HTTP by default, optional HTTPS with ACM)
+
+Parameters:
+  ProjectName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetAId:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnetBId:
+    Type: AWS::EC2::Subnet::Id
+  AppTargetPort:
+    Type: Number
+    Default: 8000
+  AcmCertArn:
+    Type: String
+    Default: ""                 # leave empty for HTTP-only
+  AlbSecurityGroupId:
+    Type: String
+    Default: ""                 # if provided, ALB will use this SG; else we create one
+
+Conditions:
+  UseTLS: !Not [ !Equals [ !Ref AcmCertArn, "" ] ]
+  UseProvidedAlbSg: !Not [ !Equals [ !Ref AlbSecurityGroupId, "" ] ]
+  CreateAlbSg: !Not [ !Condition UseProvidedAlbSg ]   # <- derive whether we should create an ALB SG
+
+Resources:
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateAlbSg             # <- reference the condition by name
+    Properties:
+      GroupDescription: !Sub "${ProjectName} ALB SG"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80,  ToPort: 80,  CidrIp: 0.0.0.0/0, Description: "HTTP from anywhere" }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: "HTTPS from anywhere" }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: "All egress" }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-alb-sg" }
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: [ !Ref PublicSubnetAId, !Ref PublicSubnetBId ]
+      SecurityGroups:
+        - !If [ UseProvidedAlbSg, !Ref AlbSecurityGroupId, !Ref AlbSg ]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      Protocol: HTTP
+      Port: !Ref AppTargetPort
+      TargetType: instance
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      Matcher: { HttpCode: "200" }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Env, Value: dev }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - UseTLS
+          - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: "443", StatusCode: HTTP_301 }
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: UseTLS
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref AcmCertArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-web-acl"
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}-web-acl"
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 10
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: common
+        - Name: AWS-AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 20
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: bad-inputs
+        - Name: AWS-AWSManagedRulesSQLiRuleSet
+          Priority: 30
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: sqli
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref Alb
+      WebACLArn: !GetAtt WebAcl.Arn
+
+Outputs:
+  AlbArn:
+    Value: !Ref Alb
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+  AppTargetGroupArn:
+    Value: !Ref TargetGroup
