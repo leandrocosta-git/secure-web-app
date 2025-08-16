@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "ALB (HTTPS-only) + WAFv2 with managed OWASP rules, access logs, header drop"
+
+Parameters:
+  ProjectName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetAId:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnetBId:
+    Type: AWS::EC2::Subnet::Id
+  AlbSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: "Optional existing SG for ALB; leave empty to create one"
+  AppTargetPort:
+    Type: Number
+    Default: 8000
+  AcmCertArn:
+    Type: String
+    Description: "REQUIRED: ACM cert ARN (same region)"
+  AccessLogsBucketName:
+    Type: String
+    Description: "REQUIRED: S3 bucket for ALB access logs (must already exist)"
+  AccessLogsPrefix:
+    Type: String
+    Default: "alb/"
+
+Conditions:
+  UseProvidedAlbSg: !Not [ !Equals [ !Ref AlbSecurityGroupId, "" ] ]
+  CreateAlbSg:      !Equals [ !Ref AlbSecurityGroupId, "" ]
+
+Resources:
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateAlbSg
+    Properties:
+      GroupDescription: !Sub "${ProjectName} ALB SG"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # HTTPS only (fix CKV_AWS_260 by NOT opening port 80)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS from anywhere"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "All egress"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-alb-sg"
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnetAId
+        - !Ref PublicSubnetBId
+      SecurityGroups:
+        - !If [ UseProvidedAlbSg, !Ref AlbSecurityGroupId, !Ref AlbSg ]
+      LoadBalancerAttributes:
+        # Drop invalid headers (fix CKV_AWS_131)
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+        # Access logging enabled (fix CKV_AWS_91)
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: !Ref AccessLogsBucketName
+        - Key: access_logs.s3.prefix
+          Value: !Ref AccessLogsPrefix
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: dev
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref AppTargetPort
+      TargetType: instance
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: "200"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: dev
+
+  # HTTPS-only listener (fix CKV_AWS_2 and CKV_AWS_103 via TLS >= 1.2 policy)
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref AcmCertArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # WAFv2 – AWS managed sets + a simple rate limit
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-web-acl"
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}-waf"
+      Rules:
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              Name: AWSManagedRulesCommonRuleSet
+              VendorName: AWS
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: common
+        - Name: AWS-AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+              VendorName: AWS
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: badinputs
+        - Name: AWS-AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              Name: AWSManagedRulesSQLiRuleSet
+              VendorName: AWS
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: sqli
+        - Name: AWS-AWSManagedRulesXSSRuleSet
+          Priority: 4
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              Name: AWSManagedRulesXSSRuleSet
+              VendorName: AWS
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: xss
+        - Name: RateLimit500IP5m
+          Priority: 10
+          Statement:
+            RateBasedStatement:
+              Limit: 500
+              AggregateKeyType: IP
+          Action: { Block: {} }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: ratelimit
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref Alb
+      WebACLArn: !GetAtt WebAcl.Arn
+
+Outputs:
+  AlbArn:
+    Value: !Ref Alb
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+  AppTargetGroupArn:
+    Value: !Ref TargetGroup

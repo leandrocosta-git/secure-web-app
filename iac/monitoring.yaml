@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Monitoring – SNS (KMS) + basic CW alarms (CPU, 5xx via ALB metric)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: secure-webapp
+  AlertEmail:
+    Type: String
+    Description: "Email to subscribe to SNS topic (confirm in inbox)"
+  AlbFullName:
+    Type: String
+    Description: "ALB full name (for metrics), e.g. app/secure-webapp-alb/abcdef1234567890"
+  AlbTargetGroupFullName:
+    Type: String
+    Description: "Target Group full name for metrics, e.g. targetgroup/secure-webapp-tg/abcdef1234567890"
+
+Resources:
+  SnsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS for ${ProjectName} alerts (SNS)"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+
+  SnsKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-sns"
+      TargetKeyId: !Ref SnsKmsKey
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+      KmsMasterKeyId: !GetAtt SnsKmsKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: dev
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref AlertsTopic
+
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-cpu-high"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      Threshold: 80
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: CPUUtilization
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: dummy # replace if you use ASG; or use InstanceId dimension per-instance
+            Period: 60
+            Stat: Average
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alb-5xx"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_ELB_5XX_Count
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !Ref AlbFullName
+            Period: 60
+            Stat: Sum
+      AlarmActions:
+        - !Ref AlertsTopic
