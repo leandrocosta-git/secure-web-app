@@ -10,6 +10,7 @@ def set_headers(resp):
     resp.headers["Referrer-Policy"] = "no-referrer"
     return resp
 
+
 @app.get("/health")
 def health():
     return "OK", 200
@@ -17,6 +18,4 @@ def health():
 
 @app.get("/")
 def index():
-    return jsonify(
-        message="hello from private ec2"
-    ), 200
+    return jsonify(message="hello from private ec2"), 200
