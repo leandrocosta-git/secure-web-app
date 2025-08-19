@@ -1,45 +1,85 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-### --------------------------
-### Config (edit or pass via env)
-### --------------------------
-#: "${PROFILE:=cloudsec-deployer}"
-#: "${REGION:=eu-west-1}"
-#: "${PROJECT:=proj_name}"
-
-# Your public IP /32 for SSH (and any direct ALB allow rules you use)
-#: "${DEV_CIDR:?Set DEV_CIDR to your public /32, e.g. 203.0.113.10/32}"
-
-# Availability Zones for subnets
-#: "${AZA:=eu-west-1a}"
-#: "${AZB:=eu-west-1b}"
-
-# AMI + instance type
-#: "${AMI_ID:=ami-xxxx}"   # AL2 in eu-west-1 (update if needed)
-#: "${INSTANCE_TYPE:=type}"
-
-# Stacks + templates
-: "${STACK_VPC:=secure-vpc-dev}"
-: "${STACK_ALB:=secure-alb-dev}"
-: "${STACK_EC2:=secure-compute-dev}"
-
-: "${VPC_TEMPLATE:=iac/vpc.yaml}"
-: "${ALB_TEMPLATE:=iac/alb_waf.yaml}"
-: "${COMPUTE_TEMPLATE:=iac/compute.yaml}"
-
-# Leave empty for HTTP only; set an ACM cert ARN for HTTPS on the ALB
-#: "${ACM_ARN:=}"
-
-### --------------------------
-### Helpers
-### --------------------------
-need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing $1" >&2; exit 1; }; }
+# ---------------------------
+# Helper functions
+# ---------------------------
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }; }
 json() { jq -r "$1"; }
+is_tty() { [[ -t 0 && -t 1 ]]; }
+ask() { # ask "Prompt" VAR default
+  local prompt="$1" var="$2" def="${3:-}"
+  if is_tty; then
+    local extra=""
+    [[ -n "$def" ]] && extra=" [$def]"
+    read -r -p "$prompt$extra: " val
+    val="${val:-$def}"
+    export "$var"="$val"
+  else
+    # in CI, require it pre-set or defaulted
+    : "${!var:=$def}"
+    export "$var"
+  fi
+}
 
-echo "== preflight =="
+# ---------------------------
+# Requirements
+# ---------------------------
 need aws
 need jq
+
+# ---------------------------
+# Config (ENV or prompts)
+# ---------------------------
+ask "AWS profile name"           PROFILE          "${PROFILE:-default}"
+ask "AWS region"                 REGION           "${REGION:-eu-west-1}"
+ask "Project name"               PROJECT          "${PROJECT:-secure-webapp}"
+
+# Your public /32 for dev access (e.g., to allow you through ALB/SG rules if used)
+# You can pre-export DEV_CIDR, or we try auto-detect. Fallback /32 is required.
+DEV_CIDR_DEFAULT="${DEV_CIDR:-}"
+if [[ -z "${DEV_CIDR_DEFAULT}" ]] && is_tty; then
+  # best-effort autodetect
+  ME="$(curl -fsS https://checkip.amazonaws.com || true)"
+  [[ -n "$ME" ]] && DEV_CIDR_DEFAULT="${ME%$'\n'}/32"
+fi
+ask "Your public IP in CIDR (/32)" DEV_CIDR "${DEV_CIDR_DEFAULT:-1.2.3.4/32}"
+
+# AZs
+ask "AZ A (e.g. eu-west-1a)"     AZA              "${AZA:-${REGION}a}"
+ask "AZ B (e.g. eu-west-1b)"     AZB              "${AZB:-${REGION}b}"
+
+# Instance settings
+ask "EC2 instance type"          INSTANCE_TYPE    "${INSTANCE_TYPE:-t3.micro}"
+ask "AMI ID (AL2 or similar)"    AMI_ID           "${AMI_ID:-ami-0c1bc246476a5572b}"
+
+# Optional ACM cert ARN (empty means HTTP only; listener will 301 when TLS provided)
+ask "ACM ARN (leave empty for HTTP only)" ACM_ARN "${ACM_ARN:-}"
+
+# ALB access logs bucket (must exist & have proper policy)
+ask "ALB access logs bucket name" ACCESS_LOGS_BUCKET "${ACCESS_LOGS_BUCKET:-secure-webapp-alb-logs}"
+
+# Stack names & templates (override via env if you like)
+STACK_VPC="${STACK_VPC:-secure-vpc-dev}"
+STACK_ALB="${STACK_ALB:-secure-alb-dev}"
+STACK_EC2="${STACK_EC2:-secure-compute-dev}"
+
+VPC_TEMPLATE="${VPC_TEMPLATE:-iac/vpc.yaml}"
+ALB_TEMPLATE="${ALB_TEMPLATE:-iac/alb_waf.yaml}"
+COMPUTE_TEMPLATE="${COMPUTE_TEMPLATE:-iac/compute.yaml}"
+
+echo "== Using profile=$PROFILE region=$REGION project=$PROJECT =="
+
+# ---------------------------
+# 0) Preflight: bucket sanity
+# ---------------------------
+echo "== preflight: check ALB logs bucket =="
+aws s3api head-bucket --bucket "$ACCESS_LOGS_BUCKET" --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1 || {
+  echo "ERROR: Bucket '$ACCESS_LOGS_BUCKET' does not exist or is not accessible."
+  echo "Create it first (private, versioning optional) and attach the ALB log-delivery policy."
+  exit 1
+}
+
 
 ### --------------------------
 ### 1) VPC with NAT
@@ -110,6 +150,7 @@ aws cloudformation deploy \
     PublicSubnetBId="$PUBB" \
     AppTargetPort=8000 \
     AcmCertArn="$ACM_ARN" \
+    AccessLogsBucketName="$ACCESS_LOGS_BUCKET" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION" --profile "$PROFILE"
 
