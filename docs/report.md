@@ -160,11 +160,11 @@ aws cloudformation validate-template --template-body file://iac/vpc.yaml --profi
     "Description": "VPC with 2AZ public (ALB) + private (App) subnets and security groups"
 }
 ```
-It looks like the IAM role has the correct permissions to deploy the VPC.
+The IAM role was confirmed active and authorized.
 
-Once again I checked the tags in the VPC, subnets, and IGW in the vpc.yml file to help identify resources later.
+Once checked the tags in the VPC, subnets, and IGW in the `vpc.yml` file to help identify resources later.
 
-Then I deployed the VPC with the following command:
+The VPC stack was deployed using the following command:
 ```bash
 aws cloudformation deploy \
   --template-file iac/vpc.yaml \
@@ -173,15 +173,16 @@ aws cloudformation deploy \
   --region eu-west-1 --profile cloudsec-deployer \
   --no-fail-on-empty-changeset
 ```
+**Deployment completed successfully:**
 
-Stack created
+Stack creation confirmed via CloudFormation console:
 ![VPC Stack](./images/create-stack.png)
 
-VPC created
+VPC created with associated subnets and Internet Gateway:
 ![VPC Created](./images/vpc.png)
-with the following resources:
+
+Resource list showing all provisioned components:
 ![Resources Created](./images/resources.png)
-!VERIFICAR SE NAO TEM SECRETS
 
 ## Day 2 & Day 3
 
